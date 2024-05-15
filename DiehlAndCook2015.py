@@ -1,49 +1,96 @@
+from typing import NamedTuple, Tuple
 import torch
-import numpy as np
-from typing import NamedTuple, Optional, Tuple
+import torch.jit
+
 from norse.torch.functional.threshold import threshold
+import norse.torch.utils.pytree as pytree
+from norse.torch.module.snn import SNNCell, SNNRecurrentCell
+from norse.torch.utils.clone import clone_tensor
+
+
+class DiehlLIFParameters(
+    pytree.StateTuple, metaclass=pytree.MultipleInheritanceNamedTupleMeta
+):
+    tau_syn_inv: torch.Tensor = torch.as_tensor(1.0 / 5e-3)
+    tau_mem_inv: torch.Tensor = torch.as_tensor(1.0 / 1e-2)
+    tau_v_th_inv: torch.Tensor = torch.as_tensor(1.0 / 1e4)
+    v_leak: torch.Tensor = torch.as_tensor(0.0)
+    v_th: torch.Tensor = torch.as_tensor(1.0)
+    v_reset: torch.Tensor = torch.as_tensor(0.0)
+    v_th_plus: torch.Tensor = torch.as_tensor(0.05)
+    v_th_max: torch.Tensor = torch.as_tensor(35.0)
+    method: str = "super"
+    alpha: float = torch.as_tensor(100.0)
+
+
+# pytype: disable=bad-unpacking,wrong-keyword-args
+# default_bio_parameters = DiehlLIFParameters(
+#     tau_syn_inv=torch.as_tensor(1 / 0.5),
+#     tau_mem_inv=torch.as_tensor(1 / 20.0),
+#     tau_v_th_inv=torch.as_tensor(1.0 / 1e4),
+#     v_leak=torch.as_tensor(-65.0),
+#     v_th=torch.as_tensor(-50.0),
+#     v_reset=torch.as_tensor(-65.0),
+#     v_th_plus=torch.as_tensor(0.05),
+#     v_th_max=torch.as_tensor(35.0),
+# )
+# pytype: enable=bad-unpacking,wrong-keyword-args
 
 
 class DiehlLIFState(NamedTuple):
     z: torch.Tensor
     v: torch.Tensor
-    g_e: torch.Tensor
-    g_i: torch.Tensor
-    delta_v_thresh: torch.Tensor
+    i: torch.Tensor
+    dv_th: torch.Tensor
 
 
-# default_bio_state = DiehlLIFState(z=0.0, v=-65.0, g_e=0.0, g_i=0.0, delta_v_thresh=)
-
-
-class DiehlLIFParameters(NamedTuple):
-    tau_syn_exc_inv: torch.Tensor = torch.as_tensor(1.0 / 5)
-    tau_syn_inh_inv: torch.Tensor = torch.as_tensor(1.0 / 5)
-    tau_v_thresh_inv: torch.Tensor = torch.as_tensor(1.0 / 1e4)
-    c_m_inv: torch.Tensor = torch.as_tensor(1 / 0.2)
-    g_l: torch.Tensor = torch.as_tensor(1 / 20 * 1 / 0.2)
-    e_rev_I: torch.Tensor = torch.as_tensor(-100)
-    e_rev_E: torch.Tensor = torch.as_tensor(60)
-    v_rest: torch.Tensor = torch.as_tensor(-20)
-    v_reset: torch.Tensor = torch.as_tensor(-70)
-    v_thresh: torch.Tensor = torch.as_tensor(-10)
-    v_thresh_plus: torch.Tensor = torch.as_tensor(0.05)
-    v_thresh_max: torch.Tensor = torch.as_tensor(35.0)
-    method: str = "super"
-    alpha: float = 100.0
-
-
-# default_bio_parameters = DiehlLIFParameters(
-#     tau_syn_exc_inv=1 / 0.3,
-#     tau_syn_inh_inv=1 / 0.5,
-#     tau_v_thresh_inv=1 / 1e4,
-#     e_rev_E=0.0,
-#     e_rev_I=-70.0,
-#     v_thresh=-50.0,
-#     v_reset=-65.0,
-#     v_rest=-65.0,
-#     v_thresh_plus=0.05,
-#     v_thresh_max=35,
+# default_bio_initial_state = DiehlLIFState(
+#     z=torch.as_tensor(0.0), v=torch.as_tensor(-65.0), i=torch.as_tensor(0.0)
 # )
+
+
+class DiehlLIFFeedForwardState(NamedTuple):
+    v: torch.Tensor
+    i: torch.Tensor
+    dv_th: torch.Tensor
+
+
+def diehl_lif_step_sparse(
+    input_spikes: torch.Tensor,
+    state: DiehlLIFState,
+    input_weights: torch.Tensor,
+    recurrent_weights: torch.Tensor,
+    p: DiehlLIFParameters,
+    dt: float = 0.001,
+) -> Tuple[torch.Tensor, DiehlLIFState]:
+    # compute current jumps
+    i_jump = (
+        state.i
+        + torch.sparse.mm(input_spikes, input_weights.t())
+        + torch.sparse.mm(state.z, recurrent_weights.t())
+    )
+
+    # compute voltage updates
+    dv = dt * p.tau_mem_inv * ((p.v_leak - state.v) + i_jump)
+    v_decayed = state.v + dv
+
+    # compute current updates
+    di = -dt * p.tau_syn_inv * i_jump
+    i_decayed = i_jump + di
+
+    # compute new spikes
+    v_th = p.v_th + state.dv_th
+    z_new = threshold(v_decayed - v_th, p.method, p.alpha)
+
+    # compute dv_th update
+    dv_th = (1 - dt * p.tau_v_th_inv) * state.dv_th + z_new * p.v_th_plus
+    dv_th = torch.clamp(dv_th, 0.0, p.v_th_max)
+
+    # compute reset
+    v_new = (1 - z_new) * v_decayed + z_new * p.v_reset
+
+    z_sparse = z_new.to_sparse()
+    return z_sparse, DiehlLIFState(z_sparse, v_new, i_decayed, dv_th)
 
 
 def diehl_lif_step(
@@ -51,201 +98,217 @@ def diehl_lif_step(
     state: DiehlLIFState,
     input_weights: torch.Tensor,
     recurrent_weights: torch.Tensor,
-    p: DiehlLIFParameters = DiehlLIFParameters(),
+    p: DiehlLIFParameters,
     dt: float = 0.001,
 ) -> Tuple[torch.Tensor, DiehlLIFState]:
-    # conductance jumps
-    g_e = state.g_e + torch.nn.functional.linear(
-        input_spikes, torch.nn.functional.relu(input_weights)
+    # compute current jumps
+    i_jump = (
+        state.i
+        + torch.nn.functional.linear(input_spikes, input_weights)
+        + torch.nn.functional.linear(state.z, recurrent_weights)
     )
-    g_i = state.g_i + torch.nn.functional.linear(
-        input_spikes, torch.nn.functional.relu(-input_weights)
-    )
+    # compute voltage updates
+    dv = dt * p.tau_mem_inv * ((p.v_leak - state.v) + i_jump)
+    v_decayed = state.v + dv
 
-    g_e += torch.nn.functional.linear(
-        state.z, torch.nn.functional.relu(recurrent_weights)
-    )
-    g_i += torch.nn.functional.linear(
-        state.z, torch.nn.functional.relu(-recurrent_weights)
-    )
-    dg_e = -dt * p.tau_syn_exc_inv * g_e
-    g_e = g_e + dg_e
-    dg_i = -dt * p.tau_syn_inh_inv * g_i
-    g_i = g_i + dg_i
+    # compute current updates
+    di = -dt * p.tau_syn_inv * i_jump
+    i_decayed = i_jump + di
 
-    dv = (
-        dt
-        * p.c_m_inv
-        * (
-            p.g_l * (p.v_rest - state.v)
-            + g_e * (p.e_rev_E - state.v)
-            + g_i * (p.e_rev_I - state.v)
-        )
-    )
-    v = state.v + dv
+    # compute new spikes
+    v_th = p.v_th + state.dv_th
+    z_new = threshold(v_decayed - v_th, p.method, p.alpha)
 
-    v_thresh = p.v_thresh + state.delta_v_thresh
-    z_new = threshold(v - v_thresh, p.method, p.alpha)
-    v = (1 - z_new) * v + z_new * p.v_reset
+    # compute dv_th update
+    dv_th = (1 - dt * p.tau_v_th_inv) * state.dv_th + z_new * p.v_th_plus
+    dv_th = torch.clamp(dv_th, 0.0, p.v_th_max)
 
-    delta_v_thresh = (
-        1 - dt * p.tau_v_thresh_inv
-    ) * state.delta_v_thresh + p.v_thresh_plus * z_new
-    delta_v_thresh = torch.clamp(delta_v_thresh, 0.0, p.v_thresh_max)
-    return z_new, DiehlLIFState(z_new, v, g_e, g_i, delta_v_thresh)
+    # compute reset
+    v_new = (1 - z_new) * v_decayed + z_new * p.v_reset
 
-
-class DiehlLIFFeedForwardState(NamedTuple):
-    v: torch.Tensor
-    g_e: torch.Tensor
-    g_i: torch.Tensor
-    delta_v_thresh: torch.Tensor
+    return z_new, DiehlLIFState(z_new, v_new, i_decayed, dv_th)
 
 
 def diehl_lif_feed_forward_step(
-    input_tensor: torch.Tensor,
+    input_spikes: torch.Tensor,
     state: DiehlLIFFeedForwardState,
-    p: DiehlLIFParameters = DiehlLIFParameters(),
+    p: DiehlLIFParameters,
     dt: float = 0.001,
 ) -> Tuple[torch.Tensor, DiehlLIFFeedForwardState]:
-    # conductance jumps
-    g_e = state.g_e + torch.nn.functional.relu(input_tensor)
-    g_i = state.g_i + torch.nn.functional.relu(-input_tensor)
+    # compute current jumps
+    i_new = state.i + input_spikes
 
-    dg_e = -dt * p.tau_syn_exc_inv * g_e
-    g_e = g_e + dg_e
-    dg_i = -dt * p.tau_syn_inh_inv * g_i
-    g_i = g_i + dg_i
+    # compute voltage updates
+    dv = dt * p.tau_mem_inv * ((p.v_leak - state.v) + i_new)
+    v_decayed = state.v + dv
 
-    dv = (
-        dt
-        * p.c_m_inv
-        * (
-            p.g_l * (p.v_rest - state.v)
-            + g_e * (p.e_rev_E - state.v)
-            + g_i * (p.e_rev_I - state.v)
+    # compute current updates
+    di = -dt * p.tau_syn_inv * i_new
+    i_decayed = i_new + di
+
+    # compute new spikes
+    v_th = p.v_th + state.dv_th
+    z_new = threshold(v_decayed - v_th, p.method, p.alpha)
+
+    # compute dv_th update
+    dv_th = (1 - dt * p.tau_v_th_inv) * state.dv_th + z_new * p.v_th_plus
+    dv_th = torch.clamp(dv_th, 0.0, p.v_th_max)
+
+    # compute reset
+    v_new = (1 - z_new) * v_decayed + z_new * p.v_reset
+
+    return z_new, DiehlLIFFeedForwardState(v_new, i_decayed, dv_th)
+
+
+def diehl_lif_feed_forward_step_sparse(
+    input_tensor: torch.Tensor,
+    state: DiehlLIFFeedForwardState,
+    p: DiehlLIFParameters,
+    dt: float = 0.001,
+) -> Tuple[torch.Tensor, DiehlLIFFeedForwardState]:  # pragma: no cover
+    # compute current jumps
+    i_jump = state.i + input_tensor
+
+    # compute voltage updates
+    dv = dt * p.tau_mem_inv * ((p.v_leak - state.v) + i_jump)
+    v_decayed = state.v + dv
+
+    # compute current updates
+    di = -dt * p.tau_syn_inv * i_jump
+    i_decayed = i_jump + di
+
+    # compute new spikes
+    v_th = p.v_th + state.dv_th
+    z_new = threshold(v_decayed - v_th, p.method, p.alpha)
+
+    # compute dv_th update
+    dv_th = (1 - dt * p.tau_v_th_inv) * state.dv_th + z_new * p.v_th_plus
+    dv_th = torch.clamp(dv_th, 0.0, p.v_th_max)
+
+    # compute reset
+    v_new = (1 - z_new) * v_decayed + z_new * p.v_reset
+
+    return z_new.to_sparse(), DiehlLIFFeedForwardState(v_new, i_decayed, dv_th)
+
+
+class DiehlLIFCell(SNNCell):
+    def __init__(self, p: DiehlLIFParameters = DiehlLIFParameters(), **kwargs):
+        super().__init__(
+            # activation=(
+            #     diehl_lif_feed_forward_adjoint_step
+            #     if p.method == "adjoint"
+            #     else diehl_lif_feed_forward_step
+            # ),
+            # activation_sparse=(
+            #     diehl_lif_feed_forward_adjoint_step_sparse
+            #     if p.method == "adjoint"
+            #     else diehl_lif_feed_forward_step_sparse
+            # ),
+            activation=diehl_lif_feed_forward_step,
+            activation_sparse=diehl_lif_feed_forward_step_sparse,
+            state_fallback=self.initial_state,
+            p=DiehlLIFParameters(
+                torch.as_tensor(p.tau_syn_inv),
+                torch.as_tensor(p.tau_mem_inv),
+                torch.as_tensor(p.tau_v_th_inv),
+                torch.as_tensor(p.v_leak),
+                torch.as_tensor(p.v_th),
+                torch.as_tensor(p.v_reset),
+                torch.as_tensor(p.v_th_plus),
+                torch.as_tensor(p.v_th_max),
+                p.method,
+                torch.as_tensor(p.alpha),
+            ),
+            **kwargs,
         )
-    )
-    v = state.v + dv
 
-    v_thresh = p.v_thresh + state.delta_v_thresh
-    z_new = threshold(v - v_thresh, p.method, p.alpha)
-    v = (1 - z_new) * v + z_new * p.v_reset
-
-    delta_v_thresh = (
-        1 - dt * p.tau_v_thresh_inv
-    ) * state.delta_v_thresh + p.v_thresh_plus * z_new
-    delta_v_thresh = torch.clamp(delta_v_thresh, 0.0, p.v_thresh_max)
-    return z_new, DiehlLIFFeedForwardState(v, g_e, g_i, delta_v_thresh)
-
-
-class DiehlLIFCell(torch.nn.Module):
-    def __init__(
-        self,
-        p: DiehlLIFParameters = DiehlLIFParameters(),
-        dt: float = 0.001,
-    ):
-        super(DiehlLIFCell, self).__init__()
-        self.p = p
-        self.dt = dt
-
-    def forward(
-        self, input_tensor: torch.Tensor, state: Optional[DiehlLIFState] = None
-    ) -> Tuple[torch.Tensor, DiehlLIFState]:
-        if state is None:
-            state = DiehlLIFFeedForwardState(
-                v=torch.zeros(
-                    input_tensor.shape,
-                    device=input_tensor.device,
-                    dtype=input_tensor.dtype,
-                ),
-                g_e=torch.zeros(
-                    input_tensor.shape,
-                    device=input_tensor.device,
-                    dtype=input_tensor.dtype,
-                ),
-                g_i=torch.zeros(
-                    input_tensor.shape,
-                    device=input_tensor.device,
-                    dtype=input_tensor.dtype,
-                ),
-                delta_v_thresh=torch.zeros(
-                    input_tensor.shape,
-                    device=input_tensor.device,
-                    dtype=input_tensor.dtype,
-                ),
-            )
-            state.v.requires_grad = True
-        return diehl_lif_feed_forward_step(
-            input_tensor,
-            state,
-            p=self.p,
-            dt=self.dt,
+    def initial_state(self, input_tensor: torch.Tensor) -> DiehlLIFFeedForwardState:
+        state = DiehlLIFFeedForwardState(
+            v=clone_tensor(self.p.v_leak),
+            i=torch.zeros(
+                input_tensor.shape,
+                device=input_tensor.device,
+                dtype=torch.float32,
+            ),
+            dv_th=torch.zeros(
+                input_tensor.shape,
+                device=input_tensor.device,
+                dtype=torch.float32,
+            ),
         )
+        state.v.requires_grad = True
+        return state
 
 
-class DiehlLIFRecurrentCell(torch.nn.Module):
+class DiehlLIFRecurrentCell(SNNRecurrentCell):
     def __init__(
         self,
         input_size: int,
         hidden_size: int,
         p: DiehlLIFParameters = DiehlLIFParameters(),
-        dt: float = 0.001,
+        **kwargs,
     ):
-        super(DiehlLIFRecurrentCell, self).__init__()
-        self.input_weights = torch.nn.Parameter(
-            torch.randn(hidden_size, input_size) / np.sqrt(input_size)
+        super().__init__(
+            # activation=diehl_lif_adjoint_step
+            # if p.method == "adjoint"
+            # else diehl_lif_step,
+            # activation_sparse=(
+            #     diehl_lif_adjoint_step_sparse
+            #     if p.method == "adjoint"
+            #     else diehl_lif_step_sparse
+            # ),
+            activation=diehl_lif_step,
+            activation_sparse=diehl_lif_step_sparse,
+            state_fallback=self.initial_state,
+            p=DiehlLIFParameters(
+                torch.as_tensor(p.tau_syn_inv),
+                torch.as_tensor(p.tau_mem_inv),
+                torch.as_tensor(p.tau_v_th_inv),
+                torch.as_tensor(p.v_leak),
+                torch.as_tensor(p.v_th),
+                torch.as_tensor(p.v_reset),
+                torch.as_tensor(p.v_th_plus),
+                torch.as_tensor(p.v_th_max),
+                p.method,
+                torch.as_tensor(p.alpha),
+            ),
+            input_size=input_size,
+            hidden_size=hidden_size,
+            **kwargs,
         )
-        self.recurrent_weights = torch.nn.Parameter(
-            torch.randn(hidden_size, hidden_size) / np.sqrt(hidden_size)
-        )
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.p = p
-        self.dt = dt
 
-    def forward(
-        self, input_tensor: torch.Tensor, state: Optional[DiehlLIFState] = None
-    ) -> Tuple[torch.Tensor, DiehlLIFState]:
-        if state is None:
-            state = DiehlLIFState(
-                z=torch.zeros(
-                    input_tensor.shape[0],
-                    self.hidden_size,
+    def initial_state(self, input_tensor: torch.Tensor) -> DiehlLIFState:
+        dims = (*input_tensor.shape[:-1], self.hidden_size)
+        state = DiehlLIFState(
+            z=(
+                torch.zeros(
+                    dims,
                     device=input_tensor.device,
                     dtype=input_tensor.dtype,
-                ),
-                v=torch.zeros(
-                    input_tensor.shape[0],
-                    self.hidden_size,
+                ).to_sparse()
+                if input_tensor.is_sparse
+                else torch.zeros(
+                    dims,
                     device=input_tensor.device,
                     dtype=input_tensor.dtype,
-                ),
-                g_e=torch.zeros(
-                    input_tensor.shape[0],
-                    self.hidden_size,
-                    device=input_tensor.device,
-                    dtype=input_tensor.dtype,
-                ),
-                g_i=torch.zeros(
-                    input_tensor.shape[0],
-                    self.hidden_size,
-                    device=input_tensor.device,
-                    dtype=input_tensor.dtype,
-                ),
-                delta_v_thresh=torch.zeros(
-                    input_tensor.shape[0],
-                    self.hidden_size,
-                    device=input_tensor.device,
-                    dtype=input_tensor.dtype,
-                ),
-            )
-            state.v.requires_grad = True
-        return diehl_lif_step(
-            input_tensor,
-            state,
-            self.input_weights,
-            self.recurrent_weights,
-            p=self.p,
-            dt=self.dt,
+                )
+            ),
+            v=torch.full(
+                dims,
+                torch.as_tensor(self.p.v_leak).detach(),
+                device=input_tensor.device,
+                dtype=torch.float32,
+            ),
+            i=torch.zeros(
+                dims,
+                device=input_tensor.device,
+                dtype=torch.float32,
+            ),
+            dv_th=torch.zeros(
+                dims,
+                device=input_tensor.device,
+                dtype=torch.float32,
+            ),
         )
+        state.v.requires_grad = True
+        return state
